@@ -1,0 +1,870 @@
+// NexaCart Prisma Schema
+// System Under Test for: Agentic AI-Based Software QA Framework
+// for Testing Tool-Using LLM Applications
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ─────────────────────────────────────────────
+// Enums
+// ─────────────────────────────────────────────
+
+enum UserRole {
+  CUSTOMER
+  ADMIN
+  SUPPORT_AGENT
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DISABLED
+}
+
+enum AddressType {
+  SHIPPING
+  BILLING
+}
+
+enum ProductStatus {
+  DRAFT
+  ACTIVE
+  INACTIVE
+}
+
+enum CartStatus {
+  ACTIVE
+  CONVERTED
+  ABANDONED
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  CANCELLED
+  COMPLETED
+}
+
+enum PaymentStatus {
+  PENDING
+  AUTHORIZED
+  PAID
+  FAILED
+  REFUNDED
+  PARTIALLY_REFUNDED
+}
+
+enum PaymentMethod {
+  CARD
+  CASH_ON_DELIVERY
+  BANK_TRANSFER
+  MOCK
+}
+
+enum ShipmentStatus {
+  NOT_READY
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  RETURNED
+}
+
+/// Who or what performed an action.
+/// IMPORTANT: This is for traceability/correlation only.
+/// It NEVER grants authorization. Authorization always comes from the
+/// authenticated user and their role stored in the database.
+enum AuditActorType {
+  USER
+  LLM_AGENT
+  SYSTEM
+}
+
+/// Inventory movement types.
+/// Phase 3: INITIAL_STOCK, ADJUSTMENT_IN, ADJUSTMENT_OUT
+/// Phase 4: RESERVATION, RELEASE
+/// Reserved for future phases: SALE, RETURN, CORRECTION
+enum InventoryMovementType {
+  INITIAL_STOCK
+  ADJUSTMENT_IN
+  ADJUSTMENT_OUT
+  RESERVATION
+  RELEASE
+  SALE
+  RETURN
+  CORRECTION
+  CANCELLATION_RESTORE
+}
+
+enum PaymentAttemptStatus {
+  SUCCEEDED
+  FAILED
+}
+
+enum RefundStatus {
+  SUCCEEDED
+  FAILED
+}
+
+enum AgentRunStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+  MAX_STEPS_REACHED
+}
+
+enum AgentToolCallStatus {
+  REQUESTED
+  SUCCEEDED
+  FAILED
+  INVALID_ARGUMENTS
+}
+
+enum QaRunStatus {
+  PREPARING
+  RUNNING_AGENT
+  EVALUATING
+  COMPLETED
+  FAILED
+}
+
+enum QaEvaluationComponent {
+  TOOL_CALL_CORRECTNESS
+  STATE_CONSISTENCY
+}
+
+enum QaSnapshotPhase {
+  BEFORE
+  AFTER
+}
+
+/// Inventory reservation status (Phase 4).
+/// CONSUMED is reserved for future checkout phase.
+enum InventoryReservationStatus {
+  ACTIVE
+  RELEASED
+  EXPIRED
+  CONSUMED
+}
+
+/// Cart mutation types for idempotency tracking (Phase 4 / Phase 5).
+enum CartMutationType {
+  ADD_ITEM
+  UPDATE_ITEM
+  REMOVE_ITEM
+  CLEAR_CART
+  RESERVE_ITEM
+  EXPIRE_RESERVATIONS
+  CHECKOUT
+}
+
+// ─────────────────────────────────────────────
+// User
+// ─────────────────────────────────────────────
+
+model User {
+  id           Int        @id @default(autoincrement())
+  email        String     @unique @db.VarChar(255)
+  passwordHash String     @db.VarChar(255)
+  firstName    String     @db.VarChar(100)
+  lastName     String     @db.VarChar(100)
+  role         UserRole   @default(CUSTOMER)
+  status       UserStatus @default(ACTIVE)
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  addresses          Address[]
+  carts              Cart[]
+  orders             Order[]
+  auditLogs          AuditLog[]
+  sessions           AuthSession[]
+  inventoryMovements InventoryMovement[] @relation("ActorUserInventoryMovements")
+  cartMutations      CartMutation[]
+  cancelledOrders    Order[]             @relation("CancelledByOrders")
+  agentRuns          AgentRun[]
+
+  @@index([email])
+  @@index([role])
+  @@index([status])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────
+// AuthSession
+// ─────────────────────────────────────────────
+
+/// Database-backed authentication session.
+/// Refresh tokens are stored as SHA-256(rawToken) only — never in plain text.
+/// A session is active when revokedAt IS NULL and expiresAt > NOW().
+model AuthSession {
+  id               String    @id @default(uuid()) @db.Uuid
+  userId           Int
+  refreshTokenHash String    @unique @db.VarChar(64)
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  ipAddress        String?   @db.VarChar(64)
+  userAgent        String?   @db.VarChar(500)
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@index([revokedAt])
+  @@map("auth_sessions")
+}
+
+// ─────────────────────────────────────────────
+// Address
+// ─────────────────────────────────────────────
+
+model Address {
+  id           Int         @id @default(autoincrement())
+  userId       Int
+  type         AddressType
+  fullName     String      @db.VarChar(200)
+  phone        String      @db.VarChar(30)
+  addressLine1 String      @db.VarChar(255)
+  addressLine2 String?     @db.VarChar(255)
+  city         String      @db.VarChar(100)
+  state        String?     @db.VarChar(100)
+  postalCode   String      @db.VarChar(20)
+  country      String      @db.VarChar(100)
+  isDefault    Boolean     @default(false)
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("addresses")
+}
+
+// ─────────────────────────────────────────────
+// Category
+// ─────────────────────────────────────────────
+
+model Category {
+  id          Int      @id @default(autoincrement())
+  name        String   @unique @db.VarChar(150)
+  slug        String   @unique @db.VarChar(150)
+  description String?  @db.Text
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  products Product[]
+
+  @@index([slug])
+  @@index([isActive])
+  @@map("categories")
+}
+
+// ─────────────────────────────────────────────
+// Product
+// ─────────────────────────────────────────────
+
+model Product {
+  id                Int           @id @default(autoincrement())
+  categoryId        Int
+  sku               String        @unique @db.VarChar(100)
+  name              String        @db.VarChar(255)
+  slug              String        @unique @db.VarChar(255)
+  description       String?       @db.Text
+  price             Decimal       @db.Decimal(12, 2)
+  currencyCode      String        @default("LKR") @db.Char(3)
+  stockQuantity     Int           @default(0)
+  reservedQuantity  Int           @default(0)
+  lowStockThreshold Int           @default(5)
+  version           Int           @default(1)
+  status            ProductStatus @default(DRAFT)
+  imageUrls         String[]
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  category              Category               @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  cartItems             CartItem[]
+  orderItems            OrderItem[]
+  inventoryMovements    InventoryMovement[]
+  inventoryReservations InventoryReservation[]
+
+  @@index([categoryId])
+  @@index([status])
+  @@index([name])
+  @@index([sku])
+  @@index([slug])
+  @@map("products")
+}
+
+// ─────────────────────────────────────────────
+// InventoryMovement
+// ─────────────────────────────────────────────
+
+/// Immutable ledger of every stock change.
+/// Records are never updated or deleted.
+/// SECURITY: metadata must never contain passwords, tokens, hashes, or credentials.
+model InventoryMovement {
+  id             Int                   @id @default(autoincrement())
+  productId      Int
+  actorUserId    Int?
+  type           InventoryMovementType
+  quantity       Int
+  stockBefore    Int
+  stockAfter     Int
+  reservedBefore Int
+  reservedAfter  Int
+  reason         String?               @db.VarChar(500)
+  referenceType  String?               @db.VarChar(50)
+  referenceId    String?               @db.VarChar(100)
+  idempotencyKey String?               @unique @db.VarChar(100)
+  requestId      String?               @db.VarChar(100)
+  qaRunId        String?               @db.VarChar(100)
+  toolCallId     String?               @db.VarChar(100)
+  metadata       Json?
+  createdAt      DateTime              @default(now())
+
+  product   Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+  actorUser User?   @relation("ActorUserInventoryMovements", fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([productId])
+  @@index([actorUserId])
+  @@index([type])
+  @@index([createdAt])
+  @@index([requestId])
+  @@index([qaRunId])
+  @@index([toolCallId])
+  @@index([referenceType, referenceId])
+  @@map("inventory_movements")
+}
+
+// ─────────────────────────────────────────────
+// Cart
+// ─────────────────────────────────────────────
+
+model Cart {
+  id             Int        @id @default(autoincrement())
+  userId         Int
+  status         CartStatus @default(ACTIVE)
+  version        Int        @default(1)
+  lastActivityAt DateTime   @default(now())
+  createdAt      DateTime   @default(now())
+  updatedAt      DateTime   @updatedAt
+
+  user         User                   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  items        CartItem[]
+  reservations InventoryReservation[]
+  mutations    CartMutation[]
+  /// The order created from this cart during checkout (Phase 5).
+  order        Order?
+
+  @@index([userId])
+  @@index([status])
+  @@map("carts")
+}
+
+// ─────────────────────────────────────────────
+// CartItem
+// ─────────────────────────────────────────────
+
+model CartItem {
+  id        Int      @id @default(autoincrement())
+  cartId    Int
+  productId Int
+  quantity  Int
+  unitPrice Decimal  @db.Decimal(12, 2)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  cart         Cart                   @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  product      Product                @relation(fields: [productId], references: [id], onDelete: Restrict)
+  reservations InventoryReservation[]
+
+  @@unique([cartId, productId])
+  @@index([cartId])
+  @@index([productId])
+  @@map("cart_items")
+}
+
+// ─────────────────────────────────────────────
+// InventoryReservation (Phase 4)
+// ─────────────────────────────────────────────
+
+model InventoryReservation {
+  id            String                     @id @default(uuid()) @db.Uuid
+  cartId        Int
+  cartItemId    Int
+  productId     Int
+  quantity      Int
+  status        InventoryReservationStatus @default(ACTIVE)
+  expiresAt     DateTime
+  releasedAt    DateTime?
+  releaseReason String?                    @db.VarChar(100)
+  /// Populated when reservation is consumed during checkout (Phase 5).
+  consumedAt    DateTime?
+  requestId     String?                    @db.VarChar(100)
+  qaRunId       String?                    @db.VarChar(100)
+  toolCallId    String?                    @db.VarChar(100)
+  metadata      Json?
+  createdAt     DateTime                   @default(now())
+  updatedAt     DateTime                   @updatedAt
+
+  cart     Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  cartItem CartItem @relation(fields: [cartItemId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([cartId])
+  @@index([cartItemId])
+  @@index([productId])
+  @@index([status])
+  @@index([expiresAt])
+  @@index([requestId])
+  @@index([qaRunId])
+  @@index([toolCallId])
+  @@map("inventory_reservations")
+}
+
+// ─────────────────────────────────────────────
+// CartMutation (Phase 4 Idempotency Ledger)
+// ─────────────────────────────────────────────
+
+model CartMutation {
+  id             String           @id @default(uuid()) @db.Uuid
+  userId         Int
+  cartId         Int?
+  type           CartMutationType
+  idempotencyKey String           @db.VarChar(100)
+  requestHash    String           @db.VarChar(64)
+  responseStatus Int?
+  responseBody   Json?
+  requestId      String?          @db.VarChar(100)
+  qaRunId        String?          @db.VarChar(100)
+  toolCallId     String?          @db.VarChar(100)
+  completedAt    DateTime?
+  createdAt      DateTime         @default(now())
+
+  user User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  cart Cart? @relation(fields: [cartId], references: [id], onDelete: SetNull)
+
+  @@unique([userId, type, idempotencyKey])
+  @@index([cartId])
+  @@index([requestId])
+  @@index([qaRunId])
+  @@index([toolCallId])
+  @@index([createdAt])
+  @@map("cart_mutations")
+}
+
+// ─────────────────────────────────────────────
+// Order
+// ─────────────────────────────────────────────
+
+model Order {
+  id                   Int            @id @default(autoincrement())
+  orderNumber          String         @unique @db.VarChar(50)
+  userId               Int
+  /// The source cart that was checked out to create this order (Phase 5).
+  sourceCartId         Int?           @unique
+  status               OrderStatus    @default(PENDING)
+  paymentStatus        PaymentStatus  @default(PENDING)
+  shipmentStatus       ShipmentStatus @default(NOT_READY)
+  subtotal             Decimal        @db.Decimal(12, 2)
+  discountAmount       Decimal        @default(0) @db.Decimal(12, 2)
+  shippingAmount       Decimal        @default(0) @db.Decimal(12, 2)
+  totalAmount          Decimal        @db.Decimal(12, 2)
+  currencyCode         String         @default("LKR") @db.Char(3)
+  shippingAddress      Json
+  customerNote         String?        @db.Text
+  cancelReason         String?        @db.Text
+  cancelledAt          DateTime?
+  cancelledByUserId    Int?
+  cancelIdempotencyKey String?        @unique @db.VarChar(100)
+  cancelRequestHash    String?        @db.VarChar(64)
+  /// When the order was officially placed (Phase 5).
+  placedAt             DateTime       @default(now())
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
+
+  user            User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  cancelledByUser User?            @relation("CancelledByOrders", fields: [cancelledByUserId], references: [id], onDelete: SetNull)
+  sourceCart      Cart?            @relation(fields: [sourceCartId], references: [id], onDelete: SetNull)
+  items           OrderItem[]
+  payment         Payment?
+  shipment        Shipment?
+  paymentAttempts PaymentAttempt[]
+  refunds         Refund[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([paymentStatus])
+  @@index([shipmentStatus])
+  @@index([createdAt])
+  @@index([sourceCartId])
+  @@map("orders")
+}
+
+// ─────────────────────────────────────────────
+// OrderItem
+// ─────────────────────────────────────────────
+
+model OrderItem {
+  id          Int      @id @default(autoincrement())
+  orderId     Int
+  productId   Int
+  sku         String   @db.VarChar(100)
+  productName String   @db.VarChar(255)
+  quantity    Int
+  unitPrice   Decimal  @db.Decimal(12, 2)
+  lineTotal   Decimal  @db.Decimal(12, 2)
+  createdAt   DateTime @default(now())
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product Product @relation(fields: [productId], references: [id], onDelete: Restrict)
+
+  @@index([orderId])
+  @@index([productId])
+  @@map("order_items")
+}
+
+// ─────────────────────────────────────────────
+// Payment
+// ─────────────────────────────────────────────
+
+model Payment {
+  id                   Int           @id @default(autoincrement())
+  orderId              Int           @unique
+  method               PaymentMethod
+  status               PaymentStatus @default(PENDING)
+  amount               Decimal       @db.Decimal(12, 2)
+  provider             String?       @db.VarChar(100)
+  transactionReference String?       @unique @db.VarChar(255)
+  idempotencyKey       String        @unique @db.VarChar(255)
+  failureReason        String?       @db.Text
+  paidAt               DateTime?
+  createdAt            DateTime      @default(now())
+  updatedAt            DateTime      @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  paymentAttempts PaymentAttempt[]
+  refunds         Refund[]
+
+  @@index([status])
+  @@index([idempotencyKey])
+  @@map("payments")
+}
+
+// ─────────────────────────────────────────────
+// PaymentAttempt (Phase 6)
+// ─────────────────────────────────────────────
+
+model PaymentAttempt {
+  id                   String               @id @default(uuid()) @db.Uuid
+  orderId              Int
+  paymentId            Int?
+  status               PaymentAttemptStatus
+  idempotencyKey       String               @db.VarChar(100)
+  amount               Decimal              @db.Decimal(12, 2)
+  transactionReference String?              @db.VarChar(150)
+  failureReason        String?              @db.VarChar(500)
+  requestId            String?              @db.VarChar(100)
+  qaRunId              String?              @db.VarChar(100)
+  toolCallId           String?              @db.VarChar(100)
+  createdAt            DateTime             @default(now())
+
+  order   Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  payment Payment? @relation(fields: [paymentId], references: [id], onDelete: SetNull)
+
+  @@unique([orderId, idempotencyKey])
+  @@index([orderId])
+  @@index([paymentId])
+  @@index([status])
+  @@index([requestId])
+  @@index([qaRunId])
+  @@index([toolCallId])
+  @@index([createdAt])
+  @@map("payment_attempts")
+}
+
+// ─────────────────────────────────────────────
+// Refund (Phase 6)
+// ─────────────────────────────────────────────
+
+model Refund {
+  id                   String       @id @default(uuid()) @db.Uuid
+  orderId              Int
+  paymentId            Int
+  amount               Decimal      @db.Decimal(12, 2)
+  status               RefundStatus
+  idempotencyKey       String       @db.VarChar(100)
+  reason               String?      @db.VarChar(500)
+  transactionReference String?      @db.VarChar(150)
+  failureReason        String?      @db.VarChar(500)
+  requestHash          String?      @db.VarChar(64)
+  requestId            String?      @db.VarChar(100)
+  qaRunId              String?      @db.VarChar(100)
+  toolCallId           String?      @db.VarChar(100)
+  createdAt            DateTime     @default(now())
+
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  payment Payment @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+
+  @@unique([orderId, idempotencyKey])
+  @@index([orderId])
+  @@index([paymentId])
+  @@index([status])
+  @@index([requestId])
+  @@index([qaRunId])
+  @@index([toolCallId])
+  @@index([createdAt])
+  @@map("refunds")
+}
+
+// ─────────────────────────────────────────────
+// Shipment
+// ─────────────────────────────────────────────
+
+model Shipment {
+  id             Int            @id @default(autoincrement())
+  orderId        Int            @unique
+  status         ShipmentStatus @default(NOT_READY)
+  carrier        String?        @db.VarChar(100)
+  trackingNumber String?        @unique @db.VarChar(255)
+  shippedAt      DateTime?
+  deliveredAt    DateTime?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([status])
+  @@map("shipments")
+}
+
+// ─────────────────────────────────────────────
+// AuditLog
+// ─────────────────────────────────────────────
+
+/// Immutable audit record for every significant state change.
+/// Used by the QA framework to trace LLM agent actions to database state.
+/// SECURITY: Never store passwords, tokens, hashes, or credentials in metadata.
+model AuditLog {
+  id         Int            @id @default(autoincrement())
+  userId     Int?
+  actorType  AuditActorType @default(USER)
+  action     String         @db.VarChar(100)
+  entityType String         @db.VarChar(100)
+  entityId   String         @db.VarChar(100)
+  requestId  String?        @db.VarChar(100)
+  qaRunId    String?        @db.VarChar(100)
+  toolCallId String?        @db.VarChar(100)
+  success    Boolean        @default(true)
+  errorCode  String?        @db.VarChar(100)
+  ipAddress  String?        @db.VarChar(64)
+  userAgent  String?        @db.VarChar(500)
+  metadata   Json?
+  createdAt  DateTime       @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+  @@index([requestId])
+  @@index([qaRunId])
+  @@index([toolCallId])
+  @@index([success])
+  @@index([errorCode])
+  @@map("audit_logs")
+}
+
+// ─────────────────────────────────────────────
+// AgentRun (Phase 7)
+// ─────────────────────────────────────────────
+
+model AgentRun {
+  id                  String         @id @default(uuid()) @db.Uuid
+  userId              Int
+  provider            String         @db.VarChar(50)
+  model               String         @db.VarChar(100)
+  systemPromptVersion String         @db.VarChar(100)
+  instruction         String         @db.Text
+  status              AgentRunStatus @default(RUNNING)
+  finalAnswer         String?        @db.Text
+  providerResponseId  String?        @db.VarChar(200)
+  totalToolCalls      Int            @default(0)
+  usage               Json?
+  requestId           String?        @db.VarChar(100)
+  qaRunId             String?        @db.VarChar(100)
+  errorCode           String?        @db.VarChar(100)
+  errorMessage        String?        @db.VarChar(1000)
+  startedAt           DateTime       @default(now())
+  completedAt         DateTime?
+
+  user      User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  toolCalls AgentToolCall[]
+  qaRun     QaRun?
+
+  @@index([userId])
+  @@index([status])
+  @@index([qaRunId])
+  @@index([requestId])
+  @@index([startedAt])
+  @@map("agent_runs")
+}
+
+// ─────────────────────────────────────────────
+// AgentToolCall (Phase 7)
+// ─────────────────────────────────────────────
+
+model AgentToolCall {
+  id             String              @id @default(uuid()) @db.Uuid
+  agentRunId     String              @db.Uuid
+  sequenceNumber Int
+  providerCallId String?             @db.VarChar(200)
+  toolName       String              @db.VarChar(100)
+  arguments      Json
+  status         AgentToolCallStatus
+  result         Json?
+  errorCode      String?             @db.VarChar(100)
+  errorMessage   String?             @db.VarChar(1000)
+  durationMs     Int?
+  requestId      String?             @db.VarChar(100)
+  qaRunId        String?             @db.VarChar(100)
+  createdAt      DateTime            @default(now())
+  completedAt    DateTime?
+
+  agentRun AgentRun @relation(fields: [agentRunId], references: [id], onDelete: Cascade)
+
+  @@unique([agentRunId, sequenceNumber])
+  @@index([agentRunId])
+  @@index([toolName])
+  @@index([status])
+  @@index([qaRunId])
+  @@index([createdAt])
+  @@map("agent_tool_calls")
+}
+
+// ─────────────────────────────────────────────
+// QaScenario (Phase 8)
+// ─────────────────────────────────────────────
+
+model QaScenario {
+  id                  String  @id @default(uuid()) @db.Uuid
+  code                String  @unique @db.VarChar(50)
+  name                String  @db.VarChar(200)
+  version             Int     @default(1)
+  description         String? @db.Text
+  instructionTemplate String  @db.Text
+
+  fixtureDefinition       Json
+  expectedToolPlan        Json
+  expectedStateAssertions Json
+
+  toolPassThreshold  Decimal @default(80) @db.Decimal(5, 2)
+  statePassThreshold Decimal @default(100) @db.Decimal(5, 2)
+
+  isActive Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  runs QaRun[]
+
+  @@index([code])
+  @@index([isActive])
+  @@map("qa_scenarios")
+}
+
+// ─────────────────────────────────────────────
+// QaRun (Phase 8)
+// ─────────────────────────────────────────────
+
+model QaRun {
+  id              String      @id @default(uuid()) @db.Uuid
+  scenarioId      String      @db.Uuid
+  scenarioVersion Int
+  status          QaRunStatus
+
+  agentRunId String? @unique @db.Uuid
+
+  resolvedInstruction String @db.Text
+  fixtureContext      Json
+
+  provider            String? @db.VarChar(50)
+  model               String? @db.VarChar(100)
+  systemPromptVersion String? @db.VarChar(100)
+
+  toolCorrectnessScore  Decimal? @db.Decimal(5, 2)
+  stateConsistencyScore Decimal? @db.Decimal(5, 2)
+
+  toolPassed    Boolean?
+  statePassed   Boolean?
+  overallPassed Boolean?
+
+  errorCode    String? @db.VarChar(100)
+  errorMessage String? @db.VarChar(1000)
+
+  startedAt   DateTime  @default(now())
+  completedAt DateTime?
+
+  scenario    QaScenario           @relation(fields: [scenarioId], references: [id], onDelete: Restrict)
+  agentRun    AgentRun?            @relation(fields: [agentRunId], references: [id], onDelete: SetNull)
+  snapshots   QaStateSnapshot[]
+  evaluations QaEvaluationResult[]
+
+  @@index([scenarioId])
+  @@index([status])
+  @@index([agentRunId])
+  @@index([startedAt])
+  @@map("qa_runs")
+}
+
+// ─────────────────────────────────────────────
+// QaStateSnapshot (Phase 8)
+// ─────────────────────────────────────────────
+
+model QaStateSnapshot {
+  id         String          @id @default(uuid()) @db.Uuid
+  qaRunId    String          @db.Uuid
+  phase      QaSnapshotPhase
+  snapshot   Json
+  capturedAt DateTime        @default(now())
+
+  qaRun QaRun @relation(fields: [qaRunId], references: [id], onDelete: Cascade)
+
+  @@unique([qaRunId, phase])
+  @@index([qaRunId])
+  @@map("qa_state_snapshots")
+}
+
+// ─────────────────────────────────────────────
+// QaEvaluationResult (Phase 8)
+// ─────────────────────────────────────────────
+
+model QaEvaluationResult {
+  id          String                @id @default(uuid()) @db.Uuid
+  qaRunId     String                @db.Uuid
+  component   QaEvaluationComponent
+  score       Decimal               @db.Decimal(5, 2)
+  passed      Boolean
+  summary     String                @db.VarChar(1000)
+  details     Json
+  evaluatedAt DateTime              @default(now())
+
+  qaRun QaRun @relation(fields: [qaRunId], references: [id], onDelete: Cascade)
+
+  @@unique([qaRunId, component])
+  @@index([qaRunId])
+  @@index([component])
+  @@index([passed])
+  @@map("qa_evaluation_results")
+}
