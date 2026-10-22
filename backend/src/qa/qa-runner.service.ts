@@ -102,6 +102,18 @@ export class QaRunnerService {
       } catch (err: unknown) {
         agentError = err instanceof Error ? err.message : String(err);
         this.logger.warn(`Agent execution failed during QA run ${qaRun.id}: ${agentError}`);
+        const failedAgentRun = (err as any)?.agentRun;
+        const failedRunId = (err as any)?.agentRunId ?? failedAgentRun?.id;
+        if (failedAgentRun) {
+          agentRun = failedAgentRun;
+        } else if (failedRunId) {
+          agentRun = await this.prisma.agentRun.findUnique({
+            where: { id: failedRunId },
+            include: {
+              toolCalls: { orderBy: { sequenceNumber: 'asc' } },
+            },
+          });
+        }
       }
 
       // Link AgentRun to QaRun if produced

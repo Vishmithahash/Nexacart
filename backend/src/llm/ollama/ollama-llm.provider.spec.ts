@@ -135,6 +135,7 @@ describe('OllamaLlmProvider', () => {
       });
       expect(sentPayload.messages[3]).toEqual({
         role: 'tool',
+        tool_name: 'search_products',
         content: JSON.stringify({ ok: true, data: { items: ['sneakers'] } }),
       });
 
@@ -484,6 +485,526 @@ describe('OllamaLlmProvider', () => {
       } catch (err: any) {
         expect(err.errorCode).toBe('LLM_INVALID_RESPONSE');
         expect(err.message).toContain('Malformed JSON in tool call arguments');
+      }
+    });
+
+    it('rejects malformed conversation history tool call arguments with LLM_INVALID_RESPONSE', async () => {
+      // 1. Array arguments in history
+      await expect(
+        provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [
+            {
+              role: 'assistant',
+              tool_calls: [
+                {
+                  id: 'call_bad',
+                  type: 'function',
+                  function: {
+                    name: 'search_products',
+                    arguments: '["array", "not", "object"]',
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      ).rejects.toThrow(ApiException);
+
+      // 2. Null arguments in history
+      await expect(
+        provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [
+            {
+              role: 'assistant',
+              tool_calls: [
+                {
+                  id: 'call_bad2',
+                  type: 'function',
+                  function: {
+                    name: 'search_products',
+                    arguments: 'null',
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      ).rejects.toThrow(ApiException);
+
+      // 3. Malformed JSON in history
+      await expect(
+        provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [
+            {
+              role: 'assistant',
+              tool_calls: [
+                {
+                  id: 'call_bad3',
+                  type: 'function',
+                  function: {
+                    name: 'search_products',
+                    arguments: '{ not valid json }',
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      ).rejects.toThrow(ApiException);
+    });
+
+    it('handles an already-aborted signal without sending a network request', async () => {
+      const abortController = new AbortController();
+      abortController.abort();
+
+      const fetchMock = jest.fn();
+      global.fetch = fetchMock;
+
+      await expect(
+        provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+          signal: abortController.signal,
+        }),
+      ).rejects.toThrow(ApiException);
+
+      expect(fetchMock).not.toHaveBeenCalled();
+    });
+
+    it('keeps timeout/cancellation active when headers arrive immediately but body reading stalls until abort', async () => {
+      const abortController = new AbortController();
+
+      // Response where text() hangs until aborted
+      const mockResponse = {
+        ok: true,
+        status: 200,
+        text: jest.fn().mockImplementation(() => {
+          return new Promise((_resolve, reject) => {
+            if (abortController.signal.aborted) {
+              const err = new Error('Body reading aborted');
+              err.name = 'AbortError';
+              return reject(err);
+            }
+            abortController.signal.addEventListener('abort', () => {
+              const err = new Error('Body reading aborted');
+              err.name = 'AbortError';
+              reject(err);
+            });
+          });
+        }),
+      } as unknown as Response;
+
+      global.fetch = jest.fn().mockResolvedValue(mockResponse);
+
+      const promise = provider.generateTurn({
+        model: 'qwen3.5:4b',
+        systemPrompt: 'System',
+        tools: [],
+        conversationHistory: [{ role: 'user', content: 'Hi' }],
+        signal: abortController.signal,
+      });
+
+      // Let fetch resolve so body reading text() starts
+      await new Promise((r) => setImmediate(r));
+
+      // Headers arrived, now body reading is in progress; trigger external cancellation
+      abortController.abort();
+
+      await expect(promise).rejects.toThrow(ApiException);
+      try {
+        await promise;
+      } catch (err: any) {
+        expect(err.errorCode).toBe('AGENT_EXECUTION_BUDGET_EXCEEDED');
+      }
+    });
+
+    it('handles multiline thinking blocks and extracts final customer text', async () => {
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: '<think>\nFirst line of reasoning\nSecond line of reasoning\n</think>\nHere is your product.',
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const result = await provider.generateTurn({
+        model: 'qwen3.5:4b',
+        systemPrompt: 'System',
+        tools: [],
+        conversationHistory: [{ role: 'user', content: 'Hi' }],
+      });
+
+      expect(result.type).toBe('text');
+      expect(result.content).toBe('Here is your product.');
+    });
+
+    it('rejects unfinished thinking blocks without exposing them as successful final answer', async () => {
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: '<think>Unfinished thinking without closing tag...',
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      await expect(
+        provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        }),
+      ).rejects.toThrow(ApiException);
+    });
+
+    it('does not expose message.thinking as final text when content is empty', async () => {
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: '',
+              thinking: 'Internal reasoning only',
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_INVALID_RESPONSE');
+      }
+    });
+
+    it('rejects response with missing done flag or done=false', async () => {
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            message: { role: 'assistant', content: 'Text without done flag' },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      await expect(
+        provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        }),
+      ).rejects.toThrow(ApiException);
+    });
+
+    it('rejects malformed non-array tool_calls structure with LLM_INVALID_RESPONSE', async () => {
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: 'Fallback text',
+              tool_calls: { name: 'not_an_array' },
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_INVALID_RESPONSE');
+        expect(err.message).toContain('must be an array');
+      }
+    });
+
+    it('distinguishes generic 404 endpoint error from missing model error', async () => {
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response('404 page not found', { status: 404 }),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).toContain('Ollama endpoint not found (404)');
+      }
+    });
+
+    it('distinguishes generic 400 request error from unsupported capabilities and sanitizes HTML', async () => {
+      // Generic 400
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(JSON.stringify({ error: 'invalid format' }), { status: 400 }),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).toContain('Invalid request sent to Ollama (400)');
+      }
+
+      // Upstream 502 with HTML body
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response('<html><body><h1>502 Bad Gateway</h1><p>proxy failed</p></body></html>', { status: 502 }),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).not.toContain('<html>');
+        expect(err.message).toContain('Ollama returned error (502)');
+      }
+    });
+
+    it('rejects malformed non-string message.content with LLM_INVALID_RESPONSE instead of TypeError', async () => {
+      // Test numeric message.content
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: { role: 'assistant', content: 12345 },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_INVALID_RESPONSE');
+        expect(err.message).toContain('content must be a string');
+      }
+
+      // Test object message.content
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: { role: 'assistant', content: { text: 'malformed' } },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_INVALID_RESPONSE');
+        expect(err.message).toContain('content must be a string');
+      }
+    });
+
+    it('allows valid structured tool calls with empty or absent message.content', async () => {
+      // Absent content (undefined)
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: {
+              role: 'assistant',
+              tool_calls: [
+                {
+                  id: 'call_valid_1',
+                  function: {
+                    name: 'search_products',
+                    arguments: { q: 'camera' },
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const result = await provider.generateTurn({
+        model: 'qwen3.5:4b',
+        systemPrompt: 'System',
+        tools: [{ name: 'search_products', description: 'Search', parameters: {} }],
+        conversationHistory: [{ role: 'user', content: 'Find camera' }],
+      });
+
+      expect(result.type).toBe('tool_call');
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls![0].name).toBe('search_products');
+
+      // Empty string content
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [
+                {
+                  id: 'call_valid_2',
+                  function: {
+                    name: 'search_products',
+                    arguments: { q: 'shoes' },
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const result2 = await provider.generateTurn({
+        model: 'qwen3.5:4b',
+        systemPrompt: 'System',
+        tools: [{ name: 'search_products', description: 'Search', parameters: {} }],
+        conversationHistory: [{ role: 'user', content: 'Find shoes' }],
+      });
+
+      expect(result2.type).toBe('tool_call');
+      expect(result2.toolCalls).toHaveLength(1);
+      expect(result2.toolCalls![0].name).toBe('search_products');
+    });
+
+    it('normalizes non-string upstream error objects safely without throwing TypeError', async () => {
+      // Test nested object error
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { code: 500, detail: 'internal engine deadlock' } }),
+          { status: 500 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).toContain('Ollama returned error (500)');
+        expect(err.message).toContain('internal engine deadlock');
+      }
+
+      // Test numeric error code in error field
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: 503 }),
+          { status: 503 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).toContain('Ollama returned error (503)');
+        expect(err.message).toContain('503');
+      }
+
+      // Test 404 with nested missing-model message
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { message: 'model "qwen3.5:4b" not found, try pulling it first' } }),
+          { status: 404 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).toContain('Model "qwen3.5:4b" is not downloaded in Ollama');
+        expect(err.message).toContain('ollama pull qwen3.5:4b');
       }
     });
   });

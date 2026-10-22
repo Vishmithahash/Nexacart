@@ -143,6 +143,13 @@ export class AgentRunnerService {
           accumulatedUsage.totalTokens += turnResult.usage.totalTokens ?? 0;
         }
 
+        // Check deadline after generateTurn resolves, before accepting final text or processing tool calls
+        if (Date.now() >= deadline) {
+          throw ApiException.agentExecutionBudgetExceeded(
+            `Agent run exceeded execution budget of ${runTimeoutMs}ms after step ${currentStep} model turn.`,
+          );
+        }
+
         if (turnResult.type === 'text') {
           const completedRun = await this.prisma.agentRun.update({
             where: { id: agentRun.id },
@@ -186,7 +193,26 @@ export class AgentRunnerService {
               this.logger.warn(
                 `Agent run ${agentRun.id} reached bounded tool-call limit of ${maxToolCalls}.`,
               );
-              break;
+              // Do not silently hide unexecuted calls when a returned batch exceeds remaining allowance
+              toolSequenceNumber++;
+              await this.prisma.agentToolCall.create({
+                data: {
+                  agentRunId: agentRun.id,
+                  sequenceNumber: toolSequenceNumber,
+                  providerCallId: toolCall.providerCallId,
+                  toolName: toolCall.name,
+                  arguments:
+                    toolCall.arguments as unknown as Prisma.InputJsonValue,
+                  status: AgentToolCallStatus.FAILED,
+                  errorCode: 'AGENT_TOOL_LIMIT_REACHED',
+                  errorMessage: `Tool call skipped: exceeded bounded tool call limit of ${maxToolCalls}.`,
+                  durationMs: 0,
+                  requestId,
+                  qaRunId,
+                  completedAt: new Date(),
+                },
+              });
+              continue;
             }
 
             if (Date.now() >= deadline) {
@@ -211,6 +237,23 @@ export class AgentRunnerService {
                 qaRunId,
               },
             });
+
+            // Check immediately before actual tool execution, including after awaiting agentToolCall.create()
+            if (Date.now() >= deadline) {
+              await this.prisma.agentToolCall.update({
+                where: { id: createdCall.id },
+                data: {
+                  status: AgentToolCallStatus.FAILED,
+                  errorCode: 'AGENT_EXECUTION_BUDGET_EXCEEDED',
+                  errorMessage: `Agent execution budget exceeded before executing tool "${toolCall.name}".`,
+                  durationMs: 0,
+                  completedAt: new Date(),
+                },
+              });
+              throw ApiException.agentExecutionBudgetExceeded(
+                `Agent run exceeded execution budget of ${runTimeoutMs}ms before executing tool "${toolCall.name}".`,
+              );
+            }
 
             const executionResult = await this.toolExecutor.executeTool(
               {
@@ -278,10 +321,24 @@ export class AgentRunnerService {
             }
           }
 
+          // Check boundary after tools execution
+          if (Date.now() >= deadline) {
+            throw ApiException.agentExecutionBudgetExceeded(
+              `Agent run exceeded execution budget of ${runTimeoutMs}ms after step ${currentStep} tool execution.`,
+            );
+          }
+
           if (totalToolCallsExecuted >= maxToolCalls) {
             break;
           }
         }
+      }
+
+      // Check boundary before terminal status selection so expired runs are not mislabeled
+      if (Date.now() >= deadline) {
+        throw ApiException.agentExecutionBudgetExceeded(
+          `Agent run exceeded execution budget of ${runTimeoutMs}ms.`,
+        );
       }
 
       const maxStepsRun = await this.prisma.agentRun.update({
@@ -306,9 +363,38 @@ export class AgentRunnerService {
 
       return maxStepsRun;
     } catch (err: unknown) {
-      const errorObj = err as { errorCode?: string; message?: string };
+      let errorCode = 'LLM_PROVIDER_ERROR';
+      let errorMessage = 'Agent execution failed.';
+
+      if (err instanceof ApiException) {
+        errorCode = err.errorCode;
+        errorMessage = err.message;
+      } else if (err instanceof Error) {
+        errorMessage = err.message || errorMessage;
+        const errRecord = err as unknown as Record<string, unknown>;
+        if (
+          typeof errRecord.errorCode === 'string' &&
+          errRecord.errorCode.trim().length > 0
+        ) {
+          errorCode = errRecord.errorCode.trim();
+        }
+      } else if (typeof err === 'string') {
+        const trimmed = err.trim();
+        if (trimmed.length > 0) {
+          errorMessage = trimmed;
+        }
+      } else if (typeof err === 'object' && err !== null) {
+        const obj = err as Record<string, unknown>;
+        if (typeof obj.message === 'string' && obj.message.trim().length > 0) {
+          errorMessage = obj.message.trim();
+        }
+        if (typeof obj.errorCode === 'string' && obj.errorCode.trim().length > 0) {
+          errorCode = obj.errorCode.trim();
+        }
+      }
+
       this.logger.error(
-        `Agent run ${agentRun.id} failed: ${errorObj?.message ?? String(err)}`,
+        `Agent run ${agentRun.id} failed: [${errorCode}] ${errorMessage}`,
       );
 
       const failedRun = await this.prisma.agentRun.update({
@@ -317,8 +403,8 @@ export class AgentRunnerService {
           status: AgentRunStatus.FAILED,
           providerResponseId: lastProviderResponseId,
           usage: accumulatedUsage,
-          errorCode: errorObj?.errorCode ?? 'LLM_PROVIDER_ERROR',
-          errorMessage: errorObj?.message ?? 'Agent execution failed.',
+          errorCode,
+          errorMessage,
           completedAt: new Date(),
         },
         include: {
@@ -329,7 +415,17 @@ export class AgentRunnerService {
       });
 
       if (err instanceof ApiException) {
+        err.withAgentRun(failedRun, agentRun.id);
         throw err;
+      }
+
+      if (typeof err === 'object' && err !== null) {
+        try {
+          (err as Record<string, unknown>).agentRunId = agentRun.id;
+          (err as Record<string, unknown>).agentRun = failedRun;
+        } catch {
+          // Object may be non-extensible or frozen
+        }
       }
 
       return failedRun;

@@ -96,7 +96,7 @@
     "coverageDirectory": "../coverage",
     "testEnvironment": "node",
     "moduleNameMapper": {
-      "^(.*)\\.js$": "$1"
+      "^((?!ipaddr).*)\\.js$": "$1"
     }
   }
 }
