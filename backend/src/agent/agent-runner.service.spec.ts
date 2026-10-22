@@ -202,6 +202,170 @@ describe('AgentRunnerService', () => {
         }),
       );
     });
+
+    it('executes multiple tool calls in a single turn sequentially in model order with separate sequence numbers', async () => {
+      llmService.generateTurn.mockResolvedValueOnce({
+        type: 'tool_call',
+        toolCalls: [
+          {
+            providerCallId: 'call_1',
+            name: 'search_products',
+            arguments: { search: 'phone' },
+          },
+          {
+            providerCallId: 'call_2',
+            name: 'get_cart',
+            arguments: {},
+          },
+        ],
+      });
+
+      toolExecutor.executeTool
+        .mockResolvedValueOnce({
+          status: 'SUCCEEDED',
+          result: { ok: true, data: { items: ['phone'] } },
+          durationMs: 20,
+        })
+        .mockResolvedValueOnce({
+          status: 'SUCCEEDED',
+          result: { ok: true, data: { items: [] } },
+          durationMs: 15,
+        });
+
+      llmService.generateTurn.mockResolvedValueOnce({
+        type: 'text',
+        content: 'Found phone and empty cart.',
+        providerResponseId: 'resp-multi',
+      });
+
+      const result = await runner.runAgent(
+        1,
+        UserRole.CUSTOMER,
+        'Search phone and view cart',
+      );
+
+      expect(result.status).toBe(AgentRunStatus.COMPLETED);
+      expect(result.finalAnswer).toBe('Found phone and empty cart.');
+
+      // Verify sequential execution in model order with sequenceNumber 1 and 2
+      expect(prisma.agentToolCall.create).toHaveBeenNthCalledWith(1, {
+        data: expect.objectContaining({
+          sequenceNumber: 1,
+          toolName: 'search_products',
+          providerCallId: 'call_1',
+        }),
+      });
+      expect(prisma.agentToolCall.create).toHaveBeenNthCalledWith(2, {
+        data: expect.objectContaining({
+          sequenceNumber: 2,
+          toolName: 'get_cart',
+          providerCallId: 'call_2',
+        }),
+      });
+
+      // Verify conversation history for next turn received both tool calls and both results
+      expect(llmService.generateTurn).toHaveBeenNthCalledWith(
+        2,
+        expect.objectContaining({
+          conversationHistory: expect.arrayContaining([
+            expect.objectContaining({
+              role: 'assistant',
+              tool_calls: expect.arrayContaining([
+                expect.objectContaining({ id: 'call_1' }),
+                expect.objectContaining({ id: 'call_2' }),
+              ]),
+            }),
+            expect.objectContaining({
+              role: 'tool',
+              tool_call_id: 'call_1',
+            }),
+            expect.objectContaining({
+              role: 'tool',
+              tool_call_id: 'call_2',
+            }),
+          ]),
+        }),
+      );
+    });
+
+    it('enforces execution budget and marks AgentRun FAILED with AGENT_EXECUTION_BUDGET_EXCEEDED without starting new tools', async () => {
+      // Mock deadline already passed
+      const RealDateNow = Date.now;
+      let counter = 0;
+      Date.now = jest.fn(() => {
+        counter += 70000; // immediately exceeds 60s budget
+        return counter;
+      });
+
+      try {
+        await expect(
+          runner.runAgent(1, UserRole.CUSTOMER, 'Instruction on expired budget'),
+        ).rejects.toThrow();
+
+        expect(prisma.agentRun.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              status: AgentRunStatus.FAILED,
+              errorCode: 'AGENT_EXECUTION_BUDGET_EXCEEDED',
+            }),
+          }),
+        );
+        expect(toolExecutor.executeTool).not.toHaveBeenCalled();
+      } finally {
+        Date.now = RealDateNow;
+      }
+    });
+
+    it('resolves model according to provider and uses OLLAMA_MODEL for Ollama without sending OpenAI model', async () => {
+      (llmService as any).providerName = 'OLLAMA';
+
+      const moduleRef = await Test.createTestingModule({
+        providers: [
+          AgentRunnerService,
+          { provide: PrismaService, useValue: prisma },
+          {
+            provide: ConfigService,
+            useValue: {
+              get: jest.fn().mockImplementation((key, defaultVal) => {
+                if (key === 'LLM_PROVIDER') return 'ollama';
+                if (key === 'OLLAMA_MODEL') return 'qwen3.5:4b';
+                if (key === 'OPENAI_MODEL') return 'gpt-4o';
+                return defaultVal;
+              }),
+            },
+          },
+          { provide: LlmService, useValue: llmService },
+          {
+            provide: AgentToolRegistryService,
+            useValue: { getToolDefinitions: jest.fn().mockReturnValue([]) },
+          },
+          { provide: AgentToolExecutorService, useValue: toolExecutor },
+          RequestContextService,
+        ],
+      }).compile();
+
+      const ollamaRunner = moduleRef.get(AgentRunnerService);
+
+      llmService.generateTurn.mockResolvedValueOnce({
+        type: 'text',
+        content: 'Ollama text',
+      });
+
+      await ollamaRunner.runAgent(1, UserRole.CUSTOMER, 'Test Ollama model');
+
+      expect(prisma.agentRun.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          provider: 'OLLAMA',
+          model: 'qwen3.5:4b',
+        }),
+      });
+
+      expect(llmService.generateTurn).toHaveBeenCalledWith(
+        expect.objectContaining({
+          model: 'qwen3.5:4b',
+        }),
+      );
+    });
   });
 
   describe('Idempotency Key Derivation Logic', () => {

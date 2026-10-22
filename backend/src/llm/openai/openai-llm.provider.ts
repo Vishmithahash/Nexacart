@@ -7,6 +7,7 @@ import {
   LlmProviderTurnOptions,
 } from '../interfaces/llm-provider.interface';
 import { LlmTurnResult } from '../types/llm-turn-result.type';
+import { LlmToolCall } from '../types/llm-tool-call.type';
 
 @Injectable()
 export class OpenAiLlmProvider implements LlmProvider {
@@ -114,25 +115,32 @@ export class OpenAiLlmProvider implements LlmProvider {
       const toolCalls = message?.tool_calls ?? response.tool_calls;
 
       if (toolCalls && toolCalls.length > 0) {
-        const firstCall = toolCalls[0];
-        if (firstCall.type === 'function' || firstCall.function) {
-          const argsStr =
-            firstCall.function?.arguments ?? firstCall.arguments ?? '{}';
-          let parsedArgs: Record<string, unknown> = {};
-          try {
-            parsedArgs = JSON.parse(argsStr) as Record<string, unknown>;
-          } catch {
-            parsedArgs = {};
-          }
+        const parsedCalls: LlmToolCall[] = [];
+        for (const call of toolCalls) {
+          if (call.type === 'function' || call.function) {
+            const argsStr =
+              call.function?.arguments ?? call.arguments ?? '{}';
+            let parsedArgs: Record<string, unknown> = {};
+            try {
+              parsedArgs = JSON.parse(argsStr) as Record<string, unknown>;
+            } catch {
+              parsedArgs = {};
+            }
 
+            parsedCalls.push({
+              providerCallId: call.id ?? call.call_id,
+              name: call.function?.name ?? call.name,
+              arguments: parsedArgs,
+            });
+          }
+        }
+
+        if (parsedCalls.length > 0) {
           return {
             providerResponseId: response.id,
             type: 'tool_call',
-            toolCall: {
-              providerCallId: firstCall.id ?? firstCall.call_id,
-              name: firstCall.function?.name ?? firstCall.name,
-              arguments: parsedArgs,
-            },
+            toolCall: parsedCalls[0],
+            toolCalls: parsedCalls,
             usage,
           };
         }

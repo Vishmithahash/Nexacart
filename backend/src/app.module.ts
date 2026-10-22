@@ -68,7 +68,31 @@ import { ApiExceptionFilter } from './common/filters/api-exception.filter';
           .default(100),
         OPENAI_API_KEY: Joi.string().allow('').optional().default(''),
         OPENAI_MODEL: Joi.string().default('gpt-4o'),
+        LLM_PROVIDER: Joi.string()
+          .trim()
+          .insensitive()
+          .valid('openai', 'ollama')
+          .default('openai'),
+        OLLAMA_BASE_URL: Joi.string()
+          .uri({ scheme: ['http', 'https'] })
+          .default('http://localhost:11434'),
+        OLLAMA_MODEL: Joi.string().default('qwen3.5:4b'),
+        OLLAMA_REQUEST_TIMEOUT_MS: Joi.number()
+          .integer()
+          .min(1000)
+          .max(600000)
+          .default(180000),
+        OLLAMA_NUM_CTX: Joi.number()
+          .integer()
+          .min(512)
+          .max(131072)
+          .default(8192),
         AGENT_MAX_STEPS: Joi.number().integer().min(1).max(50).default(10),
+        AGENT_MAX_TOOL_CALLS: Joi.number()
+          .integer()
+          .min(1)
+          .max(200)
+          .default(20),
         AGENT_MAX_INSTRUCTION_LENGTH: Joi.number()
           .integer()
           .min(100)

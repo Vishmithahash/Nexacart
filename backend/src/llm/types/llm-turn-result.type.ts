@@ -11,5 +11,6 @@ export interface LlmTurnResult {
   type: 'text' | 'tool_call';
   content?: string;
   toolCall?: LlmToolCall;
+  toolCalls?: LlmToolCall[];
   usage?: LlmUsageMetrics;
 }
