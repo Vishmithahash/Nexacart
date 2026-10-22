@@ -665,6 +665,14 @@ export class ApiException extends HttpException {
     );
   }
 
+  static agentExecutionBudgetExceeded(message?: string): ApiException {
+    return new ApiException(
+      'AGENT_EXECUTION_BUDGET_EXCEEDED',
+      message ?? 'Agent execution budget exceeded.',
+      HttpStatus.GATEWAY_TIMEOUT,
+    );
+  }
+
   // ── QA Framework (Phase 8) ──────────────────────────────────────────────
 
   static qaScenarioNotFound(code?: string): ApiException {

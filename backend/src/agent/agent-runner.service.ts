@@ -43,10 +43,33 @@ export class AgentRunnerService {
     private readonly requestContextService: RequestContextService,
   ) {}
 
+  private resolveModel(providerName: string): string {
+    const rawProvider = (
+      this.configService.get<string>('LLM_PROVIDER', 'openai') || 'openai'
+    )
+      .trim()
+      .toLowerCase();
+
+    if (rawProvider === 'ollama' || providerName.toUpperCase() === 'OLLAMA') {
+      return this.configService.get<string>('OLLAMA_MODEL', 'qwen3.5:4b');
+    }
+
+    return this.configService.get<string>('OPENAI_MODEL', 'gpt-4o');
+  }
+
   async runAgent(userId: number, role: UserRole, instruction: string) {
     const maxSteps = this.configService.get<number>('AGENT_MAX_STEPS', 10);
-    const model = this.configService.get<string>('OPENAI_MODEL', 'gpt-4o');
+    const maxToolCalls = this.configService.get<number>(
+      'AGENT_MAX_TOOL_CALLS',
+      maxSteps * 2,
+    );
+    const runTimeoutMs = this.configService.get<number>(
+      'AGENT_RUN_TIMEOUT_MS',
+      60000,
+    );
+
     const providerName = this.llmService.providerName;
+    const model = this.resolveModel(providerName);
 
     const requestId = this.requestContextService.getRequestId();
     const qaRunId = this.requestContextService.getQaRunId();
@@ -78,6 +101,8 @@ export class AgentRunnerService {
     ];
 
     let currentStep = 0;
+    let totalToolCallsExecuted = 0;
+    let toolSequenceNumber = 0;
     const accumulatedUsage = {
       promptTokens: 0,
       completionTokens: 0,
@@ -85,15 +110,26 @@ export class AgentRunnerService {
     };
     let lastProviderResponseId: string | undefined;
 
+    const runStartTime = Date.now();
+    const deadline = runStartTime + runTimeoutMs;
+
     try {
-      while (currentStep < maxSteps) {
+      while (currentStep < maxSteps && totalToolCallsExecuted < maxToolCalls) {
         currentStep++;
+
+        const remainingBeforeTurn = deadline - Date.now();
+        if (remainingBeforeTurn <= 0) {
+          throw ApiException.agentExecutionBudgetExceeded(
+            `Agent run exceeded execution budget of ${runTimeoutMs}ms before step ${currentStep}.`,
+          );
+        }
 
         const turnResult = await this.llmService.generateTurn({
           model,
           systemPrompt: BASE_SYSTEM_PROMPT,
           tools: toolDefinitions,
           conversationHistory,
+          timeoutMs: remainingBeforeTurn,
         });
 
         if (turnResult.providerResponseId) {
@@ -126,78 +162,125 @@ export class AgentRunnerService {
           return completedRun;
         }
 
-        if (turnResult.type === 'tool_call' && turnResult.toolCall) {
-          const toolCall = turnResult.toolCall;
-          const sequenceNumber = currentStep;
+        if (turnResult.type === 'tool_call') {
+          const callsToExecute =
+            turnResult.toolCalls && turnResult.toolCalls.length > 0
+              ? turnResult.toolCalls
+              : turnResult.toolCall
+                ? [turnResult.toolCall]
+                : [];
 
-          const createdCall = await this.prisma.agentToolCall.create({
-            data: {
-              agentRunId: agentRun.id,
-              sequenceNumber,
-              providerCallId: toolCall.providerCallId,
-              toolName: toolCall.name,
-              arguments: toolCall.arguments as unknown as Prisma.InputJsonValue,
-              status: AgentToolCallStatus.REQUESTED,
-              requestId,
-              qaRunId,
-            },
-          });
+          if (callsToExecute.length === 0) {
+            throw ApiException.llmInvalidResponse(
+              'Turn result indicated tool_call but provided no tool calls.',
+            );
+          }
 
-          const executionResult = await this.toolExecutor.executeTool(
-            {
-              agentToolCallId: createdCall.id,
-              toolName: toolCall.name,
-              arguments: toolCall.arguments,
-              providerCallId: toolCall.providerCallId,
-              sequenceNumber,
-            },
-            executionContext,
-          );
+          const executedCallsForTurn: Array<{
+            toolCall: (typeof callsToExecute)[number];
+            result: unknown;
+          }> = [];
 
-          const updatedCallStatus =
-            executionResult.status === 'SUCCEEDED'
-              ? AgentToolCallStatus.SUCCEEDED
-              : executionResult.status === 'INVALID_ARGUMENTS'
-                ? AgentToolCallStatus.INVALID_ARGUMENTS
-                : AgentToolCallStatus.FAILED;
+          for (const toolCall of callsToExecute) {
+            if (totalToolCallsExecuted >= maxToolCalls) {
+              this.logger.warn(
+                `Agent run ${agentRun.id} reached bounded tool-call limit of ${maxToolCalls}.`,
+              );
+              break;
+            }
 
-          await this.prisma.agentToolCall.update({
-            where: { id: createdCall.id },
-            data: {
-              status: updatedCallStatus,
-              result: executionResult.result as unknown as Prisma.InputJsonValue,
-              durationMs: executionResult.durationMs,
-              errorCode: executionResult.errorCode,
-              errorMessage: executionResult.errorMessage,
-              completedAt: new Date(),
-            },
-          });
+            if (Date.now() >= deadline) {
+              throw ApiException.agentExecutionBudgetExceeded(
+                `Agent run exceeded execution budget of ${runTimeoutMs}ms before executing tool "${toolCall.name}".`,
+              );
+            }
 
-          await this.prisma.agentRun.update({
-            where: { id: agentRun.id },
-            data: { totalToolCalls: { increment: 1 } },
-          });
+            toolSequenceNumber++;
+            const sequenceNumber = toolSequenceNumber;
 
-          conversationHistory.push({
-            role: 'assistant',
-            tool_calls: [
+            const createdCall = await this.prisma.agentToolCall.create({
+              data: {
+                agentRunId: agentRun.id,
+                sequenceNumber,
+                providerCallId: toolCall.providerCallId,
+                toolName: toolCall.name,
+                arguments:
+                  toolCall.arguments as unknown as Prisma.InputJsonValue,
+                status: AgentToolCallStatus.REQUESTED,
+                requestId,
+                qaRunId,
+              },
+            });
+
+            const executionResult = await this.toolExecutor.executeTool(
               {
+                agentToolCallId: createdCall.id,
+                toolName: toolCall.name,
+                arguments: toolCall.arguments,
+                providerCallId: toolCall.providerCallId,
+                sequenceNumber,
+              },
+              executionContext,
+            );
+
+            const updatedCallStatus =
+              executionResult.status === 'SUCCEEDED'
+                ? AgentToolCallStatus.SUCCEEDED
+                : executionResult.status === 'INVALID_ARGUMENTS'
+                  ? AgentToolCallStatus.INVALID_ARGUMENTS
+                  : AgentToolCallStatus.FAILED;
+
+            await this.prisma.agentToolCall.update({
+              where: { id: createdCall.id },
+              data: {
+                status: updatedCallStatus,
+                result:
+                  executionResult.result as unknown as Prisma.InputJsonValue,
+                durationMs: executionResult.durationMs,
+                errorCode: executionResult.errorCode,
+                errorMessage: executionResult.errorMessage,
+                completedAt: new Date(),
+              },
+            });
+
+            totalToolCallsExecuted++;
+            await this.prisma.agentRun.update({
+              where: { id: agentRun.id },
+              data: { totalToolCalls: { increment: 1 } },
+            });
+
+            executedCallsForTurn.push({
+              toolCall,
+              result: executionResult.result,
+            });
+          }
+
+          if (executedCallsForTurn.length > 0) {
+            conversationHistory.push({
+              role: 'assistant',
+              tool_calls: executedCallsForTurn.map(({ toolCall }) => ({
                 id: toolCall.providerCallId,
                 type: 'function',
                 function: {
                   name: toolCall.name,
                   arguments: JSON.stringify(toolCall.arguments),
                 },
-              },
-            ],
-          });
+              })),
+            });
 
-          conversationHistory.push({
-            role: 'tool',
-            tool_call_id: toolCall.providerCallId,
-            name: toolCall.name,
-            content: JSON.stringify(executionResult.result),
-          });
+            for (const { toolCall, result } of executedCallsForTurn) {
+              conversationHistory.push({
+                role: 'tool',
+                tool_call_id: toolCall.providerCallId,
+                name: toolCall.name,
+                content: JSON.stringify(result),
+              });
+            }
+          }
+
+          if (totalToolCallsExecuted >= maxToolCalls) {
+            break;
+          }
         }
       }
 
@@ -206,9 +289,12 @@ export class AgentRunnerService {
         data: {
           status: AgentRunStatus.MAX_STEPS_REACHED,
           providerResponseId: lastProviderResponseId,
-          usage: accumulatedUsage as unknown as Prisma.InputJsonValue,
+          usage: accumulatedUsage,
           errorCode: 'AGENT_MAX_STEPS_REACHED',
-          errorMessage: `Exceeded maximum step limit of ${maxSteps} tool call turns.`,
+          errorMessage:
+            totalToolCallsExecuted >= maxToolCalls
+              ? `Exceeded bounded tool call limit of ${maxToolCalls} tool calls.`
+              : `Exceeded maximum step limit of ${maxSteps} tool call turns.`,
           completedAt: new Date(),
         },
         include: {
@@ -230,7 +316,7 @@ export class AgentRunnerService {
         data: {
           status: AgentRunStatus.FAILED,
           providerResponseId: lastProviderResponseId,
-          usage: accumulatedUsage as unknown as Prisma.InputJsonValue,
+          usage: accumulatedUsage,
           errorCode: errorObj?.errorCode ?? 'LLM_PROVIDER_ERROR',
           errorMessage: errorObj?.message ?? 'Agent execution failed.',
           completedAt: new Date(),

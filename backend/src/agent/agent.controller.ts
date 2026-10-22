@@ -25,7 +25,7 @@ import { AgentService } from './agent.service';
 
 @ApiTags('LLM Agent')
 @ApiBearerAuth('bearer')
-@Controller('api/v1/agent/runs')
+@Controller(['agent/runs', 'api/v1/agent/runs'])
 @UseGuards(RolesGuard)
 export class AgentController {
   constructor(private readonly agentService: AgentService) {}

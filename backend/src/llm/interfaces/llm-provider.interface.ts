@@ -21,6 +21,8 @@ export interface LlmProviderTurnOptions {
   systemPrompt: string;
   tools: LlmToolDefinition[];
   conversationHistory: LlmConversationMessage[];
+  timeoutMs?: number;
+  signal?: AbortSignal;
 }
 
 export const LLM_PROVIDER = 'LLM_PROVIDER';

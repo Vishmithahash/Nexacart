@@ -23,7 +23,9 @@
 
 ## Description
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+NexaCart Backend — NestJS application with PostgreSQL, Prisma, autonomous customer LLM agents, and local Ollama support.
+
+For team setup of local Ollama (`qwen3.5:4b`), see [docs/ollama-setup.md](docs/ollama-setup.md).
 
 ## Project setup
 
