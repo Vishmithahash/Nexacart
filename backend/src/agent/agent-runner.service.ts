@@ -143,6 +143,13 @@ export class AgentRunnerService {
           accumulatedUsage.totalTokens += turnResult.usage.totalTokens ?? 0;
         }
 
+        // Check deadline after generateTurn resolves, before accepting final text or processing tool calls
+        if (Date.now() >= deadline) {
+          throw ApiException.agentExecutionBudgetExceeded(
+            `Agent run exceeded execution budget of ${runTimeoutMs}ms after step ${currentStep} model turn.`,
+          );
+        }
+
         if (turnResult.type === 'text') {
           const completedRun = await this.prisma.agentRun.update({
             where: { id: agentRun.id },
@@ -186,7 +193,26 @@ export class AgentRunnerService {
               this.logger.warn(
                 `Agent run ${agentRun.id} reached bounded tool-call limit of ${maxToolCalls}.`,
               );
-              break;
+              // Do not silently hide unexecuted calls when a returned batch exceeds remaining allowance
+              toolSequenceNumber++;
+              await this.prisma.agentToolCall.create({
+                data: {
+                  agentRunId: agentRun.id,
+                  sequenceNumber: toolSequenceNumber,
+                  providerCallId: toolCall.providerCallId,
+                  toolName: toolCall.name,
+                  arguments:
+                    toolCall.arguments as unknown as Prisma.InputJsonValue,
+                  status: AgentToolCallStatus.FAILED,
+                  errorCode: 'AGENT_TOOL_LIMIT_REACHED',
+                  errorMessage: `Tool call skipped: exceeded bounded tool call limit of ${maxToolCalls}.`,
+                  durationMs: 0,
+                  requestId,
+                  qaRunId,
+                  completedAt: new Date(),
+                },
+              });
+              continue;
             }
 
             if (Date.now() >= deadline) {
@@ -211,6 +237,23 @@ export class AgentRunnerService {
                 qaRunId,
               },
             });
+
+            // Check immediately before actual tool execution, including after awaiting agentToolCall.create()
+            if (Date.now() >= deadline) {
+              await this.prisma.agentToolCall.update({
+                where: { id: createdCall.id },
+                data: {
+                  status: AgentToolCallStatus.FAILED,
+                  errorCode: 'AGENT_EXECUTION_BUDGET_EXCEEDED',
+                  errorMessage: `Agent execution budget exceeded before executing tool "${toolCall.name}".`,
+                  durationMs: 0,
+                  completedAt: new Date(),
+                },
+              });
+              throw ApiException.agentExecutionBudgetExceeded(
+                `Agent run exceeded execution budget of ${runTimeoutMs}ms before executing tool "${toolCall.name}".`,
+              );
+            }
 
             const executionResult = await this.toolExecutor.executeTool(
               {
@@ -278,10 +321,24 @@ export class AgentRunnerService {
             }
           }
 
+          // Check boundary after tools execution
+          if (Date.now() >= deadline) {
+            throw ApiException.agentExecutionBudgetExceeded(
+              `Agent run exceeded execution budget of ${runTimeoutMs}ms after step ${currentStep} tool execution.`,
+            );
+          }
+
           if (totalToolCallsExecuted >= maxToolCalls) {
             break;
           }
         }
+      }
+
+      // Check boundary before terminal status selection so expired runs are not mislabeled
+      if (Date.now() >= deadline) {
+        throw ApiException.agentExecutionBudgetExceeded(
+          `Agent run exceeded execution budget of ${runTimeoutMs}ms.`,
+        );
       }
 
       const maxStepsRun = await this.prisma.agentRun.update({
@@ -329,9 +386,13 @@ export class AgentRunnerService {
       });
 
       if (err instanceof ApiException) {
+        (err as any).agentRunId = agentRun.id;
+        (err as any).agentRun = failedRun;
         throw err;
       }
 
+      (err as any).agentRunId = agentRun.id;
+      (err as any).agentRun = failedRun;
       return failedRun;
     }
   }

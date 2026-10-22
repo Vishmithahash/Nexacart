@@ -12,6 +12,7 @@ import { AgentRunnerService } from '../agent/agent-runner.service';
 import { RequestContextService } from '../common/request-context/request-context.service';
 import { AgentToolRegistryService } from '../agent-tools/agent-tool-registry.service';
 import { QaRunStatus, UserRole } from '../generated/prisma/client';
+import { ApiException } from '../common/exceptions/api.exception';
 
 describe('QaRunnerService', () => {
   let qaRunner: QaRunnerService;
@@ -139,5 +140,59 @@ describe('QaRunnerService', () => {
     expect(prisma.qaStateSnapshot.create).toHaveBeenCalledTimes(2); // AFTER snapshot captured
     expect(result.status).toBe(QaRunStatus.COMPLETED);
     expect(result.errorMessage).toContain('OpenAI timeout');
+  });
+
+  it('links failed agent run and preserves executed tool evidence when error metadata is attached', async () => {
+    const failedAgentRun = {
+      id: 'failed-agent-run-777',
+      provider: 'OLLAMA',
+      model: 'qwen3.5:4b',
+      systemPromptVersion: 'nexacart-customer-agent-v1',
+      status: 'FAILED',
+      toolCalls: [
+        {
+          sequenceNumber: 1,
+          toolName: 'search_products',
+          arguments: { q: 'headphones' },
+          status: 'SUCCEEDED',
+          result: { ok: true, data: { items: ['headphones'] } },
+        },
+      ],
+    };
+
+    const err = ApiException.llmProviderError('Ollama turn failed after tool execution');
+    (err as any).agentRunId = failedAgentRun.id;
+    (err as any).agentRun = failedAgentRun;
+
+    agentRunner.runAgent.mockRejectedValueOnce(err);
+
+    const result = await qaRunner.runScenario('QA-TC-001');
+
+    expect(result).toBeDefined();
+    // Verify QA run was linked to exact failed agent run
+    expect(prisma.qaRun.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'qa-run-123' },
+        data: expect.objectContaining({
+          agentRunId: 'failed-agent-run-777',
+          provider: 'OLLAMA',
+          model: 'qwen3.5:4b',
+          systemPromptVersion: 'nexacart-customer-agent-v1',
+        }),
+      }),
+    );
+
+    // Verify AFTER snapshot captured
+    expect(prisma.qaStateSnapshot.create).toHaveBeenCalledTimes(2);
+
+    // Component 1 evaluation received the executed tool call from failed agent run
+    expect(prisma.qaEvaluationResult.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          component: 'TOOL_CALL_CORRECTNESS',
+          passed: true,
+        }),
+      }),
+    );
   });
 });

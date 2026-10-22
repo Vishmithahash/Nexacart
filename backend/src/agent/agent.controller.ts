@@ -25,6 +25,8 @@ import { AgentService } from './agent.service';
 
 @ApiTags('LLM Agent')
 @ApiBearerAuth('bearer')
+// With global prefix 'api/v1', the primary route 'agent/runs' maps to canonical '/api/v1/agent/runs'.
+// 'api/v1/agent/runs' is retained as an explicit legacy alias for backwards compatibility.
 @Controller(['agent/runs', 'api/v1/agent/runs'])
 @UseGuards(RolesGuard)
 export class AgentController {
@@ -36,7 +38,7 @@ export class AgentController {
   @ApiOperation({
     summary: 'Start an autonomous customer LLM agent run',
     description:
-      'Executes a customer natural language instruction using official OpenAI tool calling and NexaCart business tools.',
+      'Executes a customer natural language instruction using structured LLM tool calling and NexaCart business tools.',
   })
   @ApiHeader({
     name: 'X-Request-ID',
