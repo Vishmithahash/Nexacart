@@ -152,3 +152,46 @@ curl.exe -s -X POST http://localhost:3000/api/v1/agent/runs `
    - `finalAnswer`: Contains natural language answer referencing actual store products
    - `toolCalls`: Contains ordered record of executed tools (`search_products`) with parameters and actual result envelope.
 
+---
+
+## 4. Failed Agent Run Retrieval & External QA Framework Contract
+
+When an autonomous customer agent run encounters an upstream model or execution error, NexaCart persists the failure and exposes a typed error-metadata contract so that external QA harnesses can inspect the full execution trace.
+
+### Error Response Contract
+
+If an error occurs during execution after an `AgentRun` has been persisted (such as `503 LLM_PROVIDER_ERROR`, `502 LLM_INVALID_RESPONSE`, or `504 AGENT_EXECUTION_BUDGET_EXCEEDED`):
+- The HTTP response status code reflects the actual error.
+- The response body contains the server-generated `agentRunId`.
+- The correlation `requestId`, `path`, and `timestamp` are preserved.
+- Full agent runs, prompts, credentials, internal tool results, and stack traces are **not** serialized into the error response.
+
+Example error body:
+```json
+{
+  "statusCode": 503,
+  "errorCode": "LLM_PROVIDER_ERROR",
+  "message": "Ollama server unreachable at http://localhost:11434. Ensure Ollama is running.",
+  "agentRunId": "48b6f380-60b1-4043-a621-e0e9fb59f0f9",
+  "requestId": "req-1729643500-abcdef",
+  "path": "/api/v1/agent/runs",
+  "timestamp": "2026-10-23T03:30:00.000Z"
+}
+```
+
+### Retrieval Flow for External QA Framework
+
+1. **Preserve Error Bodies**: The external QA client/framework must preserve non-2xx HTTP error bodies (do not discard response JSON when HTTP status is not 2xx).
+2. **Extract `agentRunId`**: Read `response.body.agentRunId` from the failed `POST /api/v1/agent/runs` response.
+3. **Authenticated GET Retrieval**: Call `GET /api/v1/agent/runs/:runId` using the **same customer identity** (Bearer token).
+4. **Inspect Trace**: Retrieve the persisted `FAILED` run, including:
+   - Run metadata (`status: "FAILED"`, `provider`, `model`, `systemPromptVersion`, `errorCode`, `errorMessage`).
+   - Ordered tool calls that succeeded prior to the failure (`toolCalls` ordered by `sequenceNumber ASC`).
+
+### Ownership & Scope Rules
+
+- **Customer Ownership**: The `GET /api/v1/agent/runs/:runId` endpoint strictly enforces customer ownership (`run.userId === customer.id`). Another customer attempting to retrieve the run will receive `404 AGENT_RUN_NOT_FOUND`.
+- **Pre-Creation Failures**: If an error occurs before an `AgentRun` is created in the database (such as blank instruction `400 AGENT_INSTRUCTION_INVALID`, unauthenticated `401 AUTH_TOKEN_INVALID`, or forbidden `403 AUTH_FORBIDDEN`), `agentRunId` is **omitted** from the error body.
+- **Lost Connection Boundary**: This contract fixes failed-run retrieval when an HTTP error response arrives from the server. It does not solve completely lost TCP connections where no HTTP response reaches the client (which would require a separately designed correlation-based lookup).
+
+

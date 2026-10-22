@@ -7,10 +7,28 @@ import type { AppErrorCode } from '../types/app-error-code.type';
  */
 export class ApiException extends HttpException {
   public readonly errorCode: string;
+  public agentRunId?: string;
+  public agentRun?: unknown;
 
   constructor(errorCode: AppErrorCode, message: string, statusCode: number) {
     super({ errorCode, message }, statusCode);
     this.errorCode = errorCode;
+  }
+
+  public withAgentRun(run: unknown, runId?: string): this {
+    if (typeof runId === 'string' && runId.trim().length > 0) {
+      this.agentRunId = runId.trim();
+    } else if (
+      run &&
+      typeof run === 'object' &&
+      'id' in run &&
+      typeof (run as Record<string, unknown>).id === 'string' &&
+      ((run as Record<string, unknown>).id as string).trim().length > 0
+    ) {
+      this.agentRunId = ((run as Record<string, unknown>).id as string).trim();
+    }
+    this.agentRun = run;
+    return this;
   }
 
   // ── Auth ─────────────────────────────────────────────────────────────────

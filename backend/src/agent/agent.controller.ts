@@ -38,7 +38,13 @@ export class AgentController {
   @ApiOperation({
     summary: 'Start an autonomous customer LLM agent run',
     description:
-      'Executes a customer natural language instruction using structured LLM tool calling and NexaCart business tools.',
+      'Executes a customer natural language instruction using structured LLM tool calling and NexaCart business tools. ' +
+      'If an agent execution error occurs after the run is created and persisted, the HTTP error response (e.g. 503 LLM_PROVIDER_ERROR, ' +
+      '502 LLM_INVALID_RESPONSE, 504 AGENT_EXECUTION_BUDGET_EXCEEDED) includes the server-created `agentRunId`. ' +
+      'External QA clients must preserve non-2xx error response bodies to extract `agentRunId` and retrieve the failed trace ' +
+      'via authenticated GET /api/v1/agent/runs/:runId with the same customer credentials. Failures occurring prior to run creation ' +
+      '(such as invalid blank instruction 400, unauthenticated 401, or forbidden 403) omit `agentRunId`. ' +
+      'Note: this retrieval flow addresses cases where an HTTP error response is received; completely lost HTTP connections require a separate correlation lookup.',
   })
   @ApiHeader({
     name: 'X-Request-ID',
@@ -56,14 +62,29 @@ export class AgentController {
   })
   @ApiResponse({
     status: 400,
-    description: 'Invalid instruction or arguments.',
+    description:
+      'Invalid instruction or arguments. If rejected prior to run creation, agentRunId is omitted.',
   })
   @ApiResponse({ status: 401, description: 'Unauthenticated.' })
   @ApiResponse({
     status: 403,
     description: 'Forbidden (CUSTOMER role required).',
   })
-  @ApiResponse({ status: 503, description: 'LLM provider not configured.' })
+  @ApiResponse({
+    status: 502,
+    description:
+      'LLM invalid response. If run was persisted, error body includes agentRunId for trace retrieval.',
+  })
+  @ApiResponse({
+    status: 503,
+    description:
+      'LLM provider error or unconfigured. If run was persisted, error body includes agentRunId for trace retrieval.',
+  })
+  @ApiResponse({
+    status: 504,
+    description:
+      'Agent execution budget exceeded. Error body includes agentRunId for trace retrieval.',
+  })
   async startRun(
     @CurrentUser() user: AuthenticatedUser,
     @Body() dto: CreateAgentRunDto,

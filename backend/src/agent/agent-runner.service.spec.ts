@@ -630,4 +630,102 @@ describe('AgentRunnerService', () => {
       expect(key1).not.toBe(key2);
     });
   });
+
+  describe('Safe Error Normalization & Metadata Attachment', () => {
+    it('safely handles thrown string values without crashing and returns failed run', async () => {
+      llmService.generateTurn.mockRejectedValueOnce('raw string failure from provider');
+
+      const result = await runner.runAgent(1, UserRole.CUSTOMER, 'Test thrown string');
+
+      expect(result.status).toBe(AgentRunStatus.FAILED);
+      expect(prisma.agentRun.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: AgentRunStatus.FAILED,
+            errorMessage: 'raw string failure from provider',
+            errorCode: 'LLM_PROVIDER_ERROR',
+          }),
+        }),
+      );
+    });
+
+    it('safely handles thrown null values without crashing and returns failed run', async () => {
+      llmService.generateTurn.mockRejectedValueOnce(null);
+
+      const result = await runner.runAgent(1, UserRole.CUSTOMER, 'Test thrown null');
+
+      expect(result.status).toBe(AgentRunStatus.FAILED);
+      expect(prisma.agentRun.update).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({
+            status: AgentRunStatus.FAILED,
+            errorMessage: 'Agent execution failed.',
+            errorCode: 'LLM_PROVIDER_ERROR',
+          }),
+        }),
+      );
+    });
+
+    it('attaches typed agentRunId and agentRun to thrown ApiException and rethrows it', async () => {
+      const providerError = ApiException.llmProviderError('Provider disconnected');
+      llmService.generateTurn.mockRejectedValueOnce(providerError);
+
+      try {
+        await runner.runAgent(1, UserRole.CUSTOMER, 'Test ApiException rethrow');
+        fail('Should have rethrown ApiException');
+      } catch (err: any) {
+        expect(err).toBe(providerError);
+        expect(err.agentRunId).toBe(mockRun.id);
+        expect(err.agentRun).toBeDefined();
+        expect(err.agentRun.status).toBe(AgentRunStatus.FAILED);
+        expect(err.agentRun.errorCode).toBe('LLM_PROVIDER_ERROR');
+      }
+    });
+
+    it('preserves successful tool call evidence when a subsequent model turn fails', async () => {
+      // Step 1: Provider returns a tool call
+      llmService.generateTurn.mockResolvedValueOnce({
+        type: 'tool_call',
+        toolCall: {
+          providerCallId: 'step1_call',
+          name: 'search_products',
+          arguments: { q: 'shoes' },
+        },
+      });
+
+      toolExecutor.executeTool.mockResolvedValueOnce({
+        status: 'SUCCEEDED',
+        result: { ok: true, data: { items: ['shoe1'] } },
+        durationMs: 30,
+      });
+
+      // Step 2: Next model turn fails with ApiException
+      const step2Error = ApiException.llmProviderError('Model crashed on second turn');
+      llmService.generateTurn.mockRejectedValueOnce(step2Error);
+
+      try {
+        await runner.runAgent(1, UserRole.CUSTOMER, 'Test tool then failure');
+        fail('Should have rethrown step 2 error');
+      } catch (err: any) {
+        expect(err).toBe(step2Error);
+        expect(err.agentRunId).toBe(mockRun.id);
+        expect(prisma.agentToolCall.create).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              providerCallId: 'step1_call',
+              toolName: 'search_products',
+              status: AgentToolCallStatus.REQUESTED,
+            }),
+          }),
+        );
+        expect(prisma.agentToolCall.update).toHaveBeenCalledWith(
+          expect.objectContaining({
+            data: expect.objectContaining({
+              status: AgentToolCallStatus.SUCCEEDED,
+            }),
+          }),
+        );
+      }
+    });
+  });
 });

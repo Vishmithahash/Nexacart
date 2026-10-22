@@ -180,4 +180,143 @@ describe('AgentController (HTTP Routing & Access Control)', () => {
       expect(response.body.id).toBe('test-run-111');
     });
   });
+
+  describe('Failed Agent Run Error Response & Trace Retrieval Flow', () => {
+    it('returns HTTP error containing server-created agentRunId, original status, code, and requestId for persisted run failure', async () => {
+      const persistedRunId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+      const failedRun = {
+        id: persistedRunId,
+        userId: customerUser.id,
+        status: 'FAILED',
+        errorCode: 'LLM_PROVIDER_ERROR',
+        errorMessage: 'Ollama server unreachable at http://localhost:11434.',
+        toolCalls: [],
+      };
+      const ex = ApiException.llmProviderError('Ollama server unreachable at http://localhost:11434.').withAgentRun(
+        failedRun,
+        persistedRunId,
+      );
+      agentService.startRun.mockRejectedValueOnce(ex);
+
+      const response = await request(app.getHttpServer())
+        .post('/api/v1/agent/runs')
+        .set('Authorization', 'Bearer customer-token')
+        .send({ instruction: 'Find black shoes' })
+        .expect(503);
+
+      expect(response.body.statusCode).toBe(503);
+      expect(response.body.errorCode).toBe('LLM_PROVIDER_ERROR');
+      expect(response.body.message).toBe('Ollama server unreachable at http://localhost:11434.');
+      expect(response.body.agentRunId).toBe(persistedRunId);
+      expect(response.body.requestId).toBe('test-req-id');
+      expect(response.body.path).toBe('/api/v1/agent/runs');
+      expect(response.body.timestamp).toBeDefined();
+
+      // Ensure internal data, prompts, full run, and stack traces are NOT exposed
+      expect(response.body.agentRun).toBeUndefined();
+      expect(response.body.stack).toBeUndefined();
+      expect(response.body.toolCalls).toBeUndefined();
+      expect(response.body.prompt).toBeUndefined();
+    });
+
+    it('omits agentRunId when failure occurs before run creation (e.g. invalid instruction rejected by agentService)', async () => {
+      agentService.startRun.mockRejectedValueOnce(
+        ApiException.agentInstructionInvalid('Instruction cannot be blank.'),
+      );
+
+      const response = await request(app.getHttpServer())
+        .post('/api/v1/agent/runs')
+        .set('Authorization', 'Bearer customer-token')
+        .send({ instruction: 'invalid' })
+        .expect(400);
+
+      expect(response.body.statusCode).toBe(400);
+      expect(response.body.errorCode).toBe('AGENT_INSTRUCTION_INVALID');
+      expect(response.body.message).toBe('Instruction cannot be blank.');
+      expect(response.body.agentRunId).toBeUndefined();
+      expect(response.body.requestId).toBe('test-req-id');
+    });
+
+    it('omits agentRunId when request fails DTO validation (e.g. whitespace-only instruction)', async () => {
+      const response = await request(app.getHttpServer())
+        .post('/api/v1/agent/runs')
+        .set('Authorization', 'Bearer customer-token')
+        .send({ instruction: '   ' })
+        .expect(400);
+
+      expect(response.body.statusCode).toBe(400);
+      expect(response.body.errorCode).toBe('VALIDATION_ERROR');
+      expect(response.body.agentRunId).toBeUndefined();
+      expect(response.body.requestId).toBe('test-req-id');
+    });
+
+    it('retains standard error shape without agentRunId for unrelated application errors', async () => {
+      agentService.startRun.mockRejectedValueOnce(
+        ApiException.productNotFound(),
+      );
+
+      const response = await request(app.getHttpServer())
+        .post('/api/v1/agent/runs')
+        .set('Authorization', 'Bearer customer-token')
+        .send({ instruction: 'Find shoes' })
+        .expect(404);
+
+      expect(response.body.statusCode).toBe(404);
+      expect(response.body.errorCode).toBe('PRODUCT_NOT_FOUND');
+      expect(response.body.agentRunId).toBeUndefined();
+      expect(response.body.requestId).toBe('test-req-id');
+    });
+
+    it('allows same customer to retrieve persisted failed run and ordered tool evidence via GET /api/v1/agent/runs/:runId', async () => {
+      const persistedRunId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+      agentService.getRun.mockImplementationOnce((userId, runId) => {
+        if (userId === customerUser.id && runId === persistedRunId) {
+          return Promise.resolve({
+            id: persistedRunId,
+            userId: customerUser.id,
+            status: 'FAILED',
+            errorCode: 'LLM_PROVIDER_ERROR',
+            errorMessage: 'Ollama server unreachable.',
+            toolCalls: [
+              {
+                sequenceNumber: 1,
+                toolName: 'search_products',
+                status: 'SUCCEEDED',
+                arguments: { query: 'shoes' },
+                result: { products: [{ id: 101, name: 'Running Shoes' }] },
+              },
+            ],
+          });
+        }
+        throw ApiException.agentRunNotFound();
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/api/v1/agent/runs/${persistedRunId}`)
+        .set('Authorization', 'Bearer customer-token')
+        .expect(200);
+
+      expect(response.body.id).toBe(persistedRunId);
+      expect(response.body.status).toBe('FAILED');
+      expect(response.body.errorCode).toBe('LLM_PROVIDER_ERROR');
+      expect(response.body.toolCalls).toHaveLength(1);
+      expect(response.body.toolCalls[0].sequenceNumber).toBe(1);
+      expect(response.body.toolCalls[0].status).toBe('SUCCEEDED');
+    });
+
+    it('rejects another customer attempting to retrieve the failed run with 404', async () => {
+      const persistedRunId = 'f47ac10b-58cc-4372-a567-0e02b2c3d479';
+      agentService.getRun.mockImplementationOnce((_userId, _runId) => {
+        throw ApiException.agentRunNotFound();
+      });
+
+      const response = await request(app.getHttpServer())
+        .get(`/api/v1/agent/runs/${persistedRunId}`)
+        .set('Authorization', 'Bearer customer-token')
+        .expect(404);
+
+      expect(response.body.statusCode).toBe(404);
+      expect(response.body.errorCode).toBe('AGENT_RUN_NOT_FOUND');
+    });
+  });
 });

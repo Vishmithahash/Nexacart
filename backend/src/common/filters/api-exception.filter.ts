@@ -20,8 +20,9 @@ interface ErrorResponse {
   statusCode: number;
   errorCode: string;
   message: string;
-  path: string;
+  agentRunId?: string;
   requestId: string;
+  path: string;
   timestamp: string;
 }
 
@@ -41,19 +42,21 @@ export class ApiExceptionFilter implements ExceptionFilter {
     const path = request.url;
     const timestamp = new Date().toISOString();
 
-    const { statusCode, errorCode, message } = this.resolveError(exception);
+    const { statusCode, errorCode, message, agentRunId } =
+      this.resolveError(exception);
 
     // Log safely — no stack traces in production, no sensitive data
     this.logger.warn(
-      `[${requestId}] ${statusCode} ${errorCode} — ${path} — ${message}`,
+      `[${requestId}] ${statusCode} ${errorCode} — ${path} — ${message}${agentRunId ? ` (run: ${agentRunId})` : ''}`,
     );
 
     const body: ErrorResponse = {
       statusCode,
       errorCode,
       message,
-      path,
+      ...(agentRunId ? { agentRunId } : {}),
       requestId,
+      path,
       timestamp,
     };
 
@@ -64,6 +67,7 @@ export class ApiExceptionFilter implements ExceptionFilter {
     statusCode: number;
     errorCode: string;
     message: string;
+    agentRunId?: string;
   } {
     // Our own structured exceptions — extract errorCode from response body
     if (exception instanceof ApiException) {
@@ -71,10 +75,19 @@ export class ApiExceptionFilter implements ExceptionFilter {
         errorCode: string;
         message: string;
       };
+      let agentRunId: string | undefined;
+      if (
+        typeof exception.agentRunId === 'string' &&
+        exception.agentRunId.trim().length > 0
+      ) {
+        agentRunId = exception.agentRunId.trim();
+      }
+
       return {
         statusCode: exception.getStatus(),
         errorCode: body.errorCode ?? 'API_ERROR',
         message: body.message ?? 'An error occurred.',
+        ...(agentRunId ? { agentRunId } : {}),
       };
     }
 

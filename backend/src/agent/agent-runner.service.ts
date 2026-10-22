@@ -363,9 +363,38 @@ export class AgentRunnerService {
 
       return maxStepsRun;
     } catch (err: unknown) {
-      const errorObj = err as { errorCode?: string; message?: string };
+      let errorCode = 'LLM_PROVIDER_ERROR';
+      let errorMessage = 'Agent execution failed.';
+
+      if (err instanceof ApiException) {
+        errorCode = err.errorCode;
+        errorMessage = err.message;
+      } else if (err instanceof Error) {
+        errorMessage = err.message || errorMessage;
+        const errRecord = err as unknown as Record<string, unknown>;
+        if (
+          typeof errRecord.errorCode === 'string' &&
+          errRecord.errorCode.trim().length > 0
+        ) {
+          errorCode = errRecord.errorCode.trim();
+        }
+      } else if (typeof err === 'string') {
+        const trimmed = err.trim();
+        if (trimmed.length > 0) {
+          errorMessage = trimmed;
+        }
+      } else if (typeof err === 'object' && err !== null) {
+        const obj = err as Record<string, unknown>;
+        if (typeof obj.message === 'string' && obj.message.trim().length > 0) {
+          errorMessage = obj.message.trim();
+        }
+        if (typeof obj.errorCode === 'string' && obj.errorCode.trim().length > 0) {
+          errorCode = obj.errorCode.trim();
+        }
+      }
+
       this.logger.error(
-        `Agent run ${agentRun.id} failed: ${errorObj?.message ?? String(err)}`,
+        `Agent run ${agentRun.id} failed: [${errorCode}] ${errorMessage}`,
       );
 
       const failedRun = await this.prisma.agentRun.update({
@@ -374,8 +403,8 @@ export class AgentRunnerService {
           status: AgentRunStatus.FAILED,
           providerResponseId: lastProviderResponseId,
           usage: accumulatedUsage,
-          errorCode: errorObj?.errorCode ?? 'LLM_PROVIDER_ERROR',
-          errorMessage: errorObj?.message ?? 'Agent execution failed.',
+          errorCode,
+          errorMessage,
           completedAt: new Date(),
         },
         include: {
@@ -386,13 +415,19 @@ export class AgentRunnerService {
       });
 
       if (err instanceof ApiException) {
-        (err as any).agentRunId = agentRun.id;
-        (err as any).agentRun = failedRun;
+        err.withAgentRun(failedRun, agentRun.id);
         throw err;
       }
 
-      (err as any).agentRunId = agentRun.id;
-      (err as any).agentRun = failedRun;
+      if (typeof err === 'object' && err !== null) {
+        try {
+          (err as Record<string, unknown>).agentRunId = agentRun.id;
+          (err as Record<string, unknown>).agentRun = failedRun;
+        } catch {
+          // Object may be non-extensible or frozen
+        }
+      }
+
       return failedRun;
     }
   }

@@ -235,6 +235,26 @@ export class OllamaLlmProvider implements LlmProvider {
         );
       }
 
+      if (
+        message.content !== undefined &&
+        message.content !== null &&
+        typeof message.content !== 'string'
+      ) {
+        throw ApiException.llmInvalidResponse(
+          'Ollama message content must be a string.',
+        );
+      }
+
+      if (
+        message.thinking !== undefined &&
+        message.thinking !== null &&
+        typeof message.thinking !== 'string'
+      ) {
+        throw ApiException.llmInvalidResponse(
+          'Ollama message thinking must be a string.',
+        );
+      }
+
       const usage: LlmUsageMetrics | undefined =
         responseJson.prompt_eval_count !== undefined ||
         responseJson.eval_count !== undefined
@@ -342,7 +362,7 @@ export class OllamaLlmProvider implements LlmProvider {
       // - Documented filtering behavior: Strip reasoning tags produced by reasoning/thinking models
       //   to ensure only final customer-facing responses are returned, while rejecting reasoning-only
       //   or unfinished thinking turns.
-      const rawContent = message.content ?? '';
+      const rawContent = typeof message.content === 'string' ? message.content : '';
       const sanitizedContent = rawContent
         .replace(/<think>[\s\S]*?<\/think>/gi, '') // Strip complete thinking blocks
         .replace(/<think>[\s\S]*$/gi, '')          // Strip unclosed/unfinished thinking blocks
@@ -370,11 +390,18 @@ export class OllamaLlmProvider implements LlmProvider {
 
   private handleHttpError(
     status: number,
-    errorBody: string,
+    errorBody: unknown,
     model: string,
   ): never {
+    const rawErrorBody =
+      typeof errorBody === 'string'
+        ? errorBody
+        : typeof errorBody === 'object' && errorBody !== null
+          ? JSON.stringify(errorBody)
+          : String(errorBody ?? '');
+
     // Sanitize and bound the error message to avoid exposing raw HTML or huge bodies
-    let sanitized = errorBody.trim();
+    let sanitized = rawErrorBody.trim();
     if (
       sanitized.startsWith('<') ||
       sanitized.toLowerCase().includes('<!doctype') ||
@@ -383,21 +410,34 @@ export class OllamaLlmProvider implements LlmProvider {
       sanitized = 'Upstream returned non-JSON error response';
     } else {
       try {
-        const parsed = JSON.parse(sanitized);
+        const parsed: unknown = JSON.parse(sanitized);
         if (parsed && typeof parsed === 'object') {
-          sanitized = parsed.error || parsed.message || JSON.stringify(parsed);
+          const rec = parsed as Record<string, unknown>;
+          const candidate = rec.error ?? rec.message;
+          if (typeof candidate === 'string') {
+            sanitized = candidate;
+          } else if (candidate !== undefined && candidate !== null) {
+            sanitized = JSON.stringify(candidate);
+          } else {
+            sanitized = JSON.stringify(parsed);
+          }
         }
       } catch {
         // Not JSON, keep text
       }
     }
+
+    if (typeof sanitized !== 'string') {
+      sanitized = String(sanitized);
+    }
+
     // Bound length to at most 200 characters and strip internal control characters
     if (sanitized.length > 200) {
       sanitized = `${sanitized.substring(0, 197)}...`;
     }
     sanitized = sanitized.replace(/[\r\n\t]+/g, ' ').trim();
 
-    const lowerBody = (errorBody + ' ' + sanitized).toLowerCase();
+    const lowerBody = (rawErrorBody + ' ' + sanitized).toLowerCase();
 
     // 1. Missing model error: 404 with indication of model not found
     if (

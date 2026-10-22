@@ -816,5 +816,196 @@ describe('OllamaLlmProvider', () => {
         expect(err.message).toContain('Ollama returned error (502)');
       }
     });
+
+    it('rejects malformed non-string message.content with LLM_INVALID_RESPONSE instead of TypeError', async () => {
+      // Test numeric message.content
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: { role: 'assistant', content: 12345 },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_INVALID_RESPONSE');
+        expect(err.message).toContain('content must be a string');
+      }
+
+      // Test object message.content
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: { role: 'assistant', content: { text: 'malformed' } },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_INVALID_RESPONSE');
+        expect(err.message).toContain('content must be a string');
+      }
+    });
+
+    it('allows valid structured tool calls with empty or absent message.content', async () => {
+      // Absent content (undefined)
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: {
+              role: 'assistant',
+              tool_calls: [
+                {
+                  id: 'call_valid_1',
+                  function: {
+                    name: 'search_products',
+                    arguments: { q: 'camera' },
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const result = await provider.generateTurn({
+        model: 'qwen3.5:4b',
+        systemPrompt: 'System',
+        tools: [{ name: 'search_products', description: 'Search', parameters: {} }],
+        conversationHistory: [{ role: 'user', content: 'Find camera' }],
+      });
+
+      expect(result.type).toBe('tool_call');
+      expect(result.toolCalls).toHaveLength(1);
+      expect(result.toolCalls![0].name).toBe('search_products');
+
+      // Empty string content
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            done: true,
+            done_reason: 'stop',
+            message: {
+              role: 'assistant',
+              content: '',
+              tool_calls: [
+                {
+                  id: 'call_valid_2',
+                  function: {
+                    name: 'search_products',
+                    arguments: { q: 'shoes' },
+                  },
+                },
+              ],
+            },
+          }),
+          { status: 200 },
+        ),
+      );
+
+      const result2 = await provider.generateTurn({
+        model: 'qwen3.5:4b',
+        systemPrompt: 'System',
+        tools: [{ name: 'search_products', description: 'Search', parameters: {} }],
+        conversationHistory: [{ role: 'user', content: 'Find shoes' }],
+      });
+
+      expect(result2.type).toBe('tool_call');
+      expect(result2.toolCalls).toHaveLength(1);
+      expect(result2.toolCalls![0].name).toBe('search_products');
+    });
+
+    it('normalizes non-string upstream error objects safely without throwing TypeError', async () => {
+      // Test nested object error
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { code: 500, detail: 'internal engine deadlock' } }),
+          { status: 500 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).toContain('Ollama returned error (500)');
+        expect(err.message).toContain('internal engine deadlock');
+      }
+
+      // Test numeric error code in error field
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: 503 }),
+          { status: 503 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).toContain('Ollama returned error (503)');
+        expect(err.message).toContain('503');
+      }
+
+      // Test 404 with nested missing-model message
+      global.fetch = jest.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({ error: { message: 'model "qwen3.5:4b" not found, try pulling it first' } }),
+          { status: 404 },
+        ),
+      );
+
+      try {
+        await provider.generateTurn({
+          model: 'qwen3.5:4b',
+          systemPrompt: 'System',
+          tools: [],
+          conversationHistory: [{ role: 'user', content: 'Hi' }],
+        });
+        fail('Should have thrown');
+      } catch (err: any) {
+        expect(err.errorCode).toBe('LLM_PROVIDER_ERROR');
+        expect(err.message).toContain('Model "qwen3.5:4b" is not downloaded in Ollama');
+        expect(err.message).toContain('ollama pull qwen3.5:4b');
+      }
+    });
   });
 });
